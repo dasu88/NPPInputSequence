@@ -14,19 +14,18 @@ constexpr UINT NPPM_GETCURRENTSCINTILLA = NPPMSG + 4;
 constexpr UINT SCI_GETSELECTIONS = 2570;
 constexpr UINT SCI_GETSELECTIONNSTART = 2585;
 constexpr UINT SCI_GETSELECTIONNEND = 2587;
-constexpr UINT SCI_SETSEL = 2160;
-constexpr UINT SCI_REPLACESEL = 2170;
+constexpr UINT SCI_SETTARGETRANGE = 2686;
+constexpr UINT SCI_REPLACETARGET = 2194;
+constexpr UINT SCI_GETREADONLY = 2140;
 constexpr UINT SCI_GETTEXT = 2182;
 constexpr UINT SCI_GETTEXTLENGTH = 2183;
-constexpr UINT SCI_SETTEXT = 2181;
 constexpr UINT SCI_BEGINUNDOACTION = 2078;
 constexpr UINT SCI_ENDUNDOACTION = 2079;
 constexpr UINT SCI_UNDO = 2176;
-constexpr UINT SCI_POINTXFROMPOSITION = 2164;
-constexpr UINT SCI_POINTYFROMPOSITION = 2165;
-constexpr UINT SCI_TEXTHEIGHT = 2279;
-constexpr UINT SCI_LINEFROMPOSITION = 2166;
-constexpr UINT SCI_POSITIONFROMLINE = 2167;
+constexpr UINT SCI_GETFIRSTVISIBLELINE = 2152;
+constexpr UINT SCI_SETFIRSTVISIBLELINE = 2613;
+constexpr UINT SCI_SETXOFFSET = 2397;
+constexpr UINT SCI_GETXOFFSET = 2398;
 
 struct NppData { HWND nppHandle, scintillaMainHandle, scintillaSecondHandle; };
 struct ShortcutKey { bool isCtrl, isAlt, isShift; unsigned char key; };
@@ -41,6 +40,8 @@ NppData g_npp{};
 ShortcutKey g_shortcut{true, true, false, '0'};
 FuncItem g_commands[2]{};
 constexpr wchar_t DialogClass[] = L"InputSequenceDialogWindow";
+constexpr int DialogWidth = 478;
+constexpr int DialogHeight = 145;
 constexpr int EditId = 1001;
 constexpr int OkId = IDOK;
 constexpr int CancelId = IDCANCEL;
@@ -55,11 +56,34 @@ struct SequenceSpec {
     std::string suffix;
     bool literalOnly;
 };
-struct Selection { LRESULT start; LRESULT end; };
+struct EditorViewport {
+    static EditorViewport capture(HWND editor) {
+        return {
+            SendMessage(editor, SCI_GETFIRSTVISIBLELINE, 0, 0),
+            SendMessage(editor, SCI_GETXOFFSET, 0, 0)
+        };
+    }
+
+    void restore(HWND editor) const {
+        SendMessage(editor, SCI_SETFIRSTVISIBLELINE, firstVisibleLine, 0);
+        SendMessage(editor, SCI_SETXOFFSET, xOffset, 0);
+    }
+
+    LRESULT firstVisibleLine;
+    LRESULT xOffset;
+};
+
+struct Selection {
+    LRESULT position;
+    size_t sequenceIndex;
+    std::string original;
+    std::string preview;
+};
+
 struct PreviewSession {
     HWND editor{};
+    EditorViewport viewport{};
     std::vector<Selection> ranges;
-    std::string originalText;
     bool undoActionOpen{};
     bool previewApplied{};
 };
@@ -257,83 +281,83 @@ HWND currentScintilla() {
     return view == 0 ? g_npp.scintillaMainHandle : g_npp.scintillaSecondHandle;
 }
 
-void applySequence(HWND editor, const std::vector<Selection>& ranges, const SequenceSpec& spec) {
-    if (ranges.empty()) return;
-    std::vector<std::string> values;
-    values.reserve(ranges.size());
-    for (size_t i = 0; i < ranges.size(); ++i) {
-        values.push_back(spec.literalOnly ? spec.suffix : formatNumber(spec.start + spec.step * static_cast<long long>(i), spec));
-    }
-    // SCI_SETSEL removes multi-selections, so positions must be captured above.
-    // Work backwards: replacing later ranges cannot change earlier offsets.
-    for (int i = static_cast<int>(ranges.size()) - 1; i >= 0; --i) {
-        const Selection& range = ranges[static_cast<size_t>(i)];
-        SendMessage(editor, SCI_SETSEL, range.start, range.end);
-        const std::string& value = values[static_cast<size_t>(i)];
-        SendMessage(editor, SCI_REPLACESEL, 0, reinterpret_cast<LPARAM>(value.c_str()));
-    }
-}
-
 void startPreviewSession() {
     g_preview = {};
-    g_preview.editor = currentScintilla();
-    const int selectionCount = static_cast<int>(SendMessage(g_preview.editor, SCI_GETSELECTIONS, 0, 0));
+    const HWND editor = currentScintilla();
+    g_preview.editor = editor;
+    g_preview.viewport = EditorViewport::capture(editor);
+    if (SendMessage(editor, SCI_GETREADONLY, 0, 0)) return;
+
+    const auto length = static_cast<size_t>(SendMessage(editor, SCI_GETTEXTLENGTH, 0, 0));
+    std::string originalText(length + 1, '\0');
+    SendMessage(editor, SCI_GETTEXT, length + 1, reinterpret_cast<LPARAM>(originalText.data()));
+    const int selectionCount = static_cast<int>(SendMessage(editor, SCI_GETSELECTIONS, 0, 0));
     for (int i = 0; i < selectionCount; ++i) {
-        g_preview.ranges.push_back({
-            SendMessage(g_preview.editor, SCI_GETSELECTIONNSTART, i, 0),
-            SendMessage(g_preview.editor, SCI_GETSELECTIONNEND, i, 0)
-        });
+        const auto start = SendMessage(editor, SCI_GETSELECTIONNSTART, i, 0);
+        const auto end = SendMessage(editor, SCI_GETSELECTIONNEND, i, 0);
+        const auto original = originalText.substr(start, end - start);
+        g_preview.ranges.push_back({start, static_cast<size_t>(i), original, original});
     }
-    const auto length = static_cast<size_t>(SendMessage(g_preview.editor, SCI_GETTEXTLENGTH, 0, 0));
-    g_preview.originalText.resize(length + 1);
-    SendMessage(g_preview.editor, SCI_GETTEXT, static_cast<WPARAM>(length + 1), reinterpret_cast<LPARAM>(g_preview.originalText.data()));
-    g_preview.originalText.resize(length);
-    SendMessage(g_preview.editor, SCI_BEGINUNDOACTION, 0, 0);
+    std::stable_sort(g_preview.ranges.begin(), g_preview.ranges.end(),
+        [](const Selection& a, const Selection& b) {
+            if (a.position != b.position) return a.position < b.position;
+            return a.original.size() < b.original.size();
+        });
+    SendMessage(editor, SCI_BEGINUNDOACTION, 0, 0);
     g_preview.undoActionOpen = true;
 }
 
 void renderPreview(HWND dialog) {
     if (!g_preview.undoActionOpen) return;
-    SendMessage(g_preview.editor, SCI_SETTEXT, 0, reinterpret_cast<LPARAM>(g_preview.originalText.c_str()));
     wchar_t buffer[512]{};
     GetWindowTextW(GetDlgItem(dialog, EditId), buffer, 512);
     SequenceSpec spec{}; std::wstring error;
-    if (parseSpec(buffer, spec, error)) applySequence(g_preview.editor, g_preview.ranges, spec);
-    g_preview.previewApplied = true;
+    const bool valid = parseSpec(buffer, spec, error);
+    // Earlier replacements shift the byte positions of later selections.
+    LRESULT offset = 0;
+    for (auto& range : g_preview.ranges) {
+        const auto position = range.position + offset;
+        range.position = position;
+        const auto oldLength = static_cast<LRESULT>(range.preview.size());
+        std::string value = range.original;
+        if (valid) {
+            value = spec.literalOnly ? spec.suffix
+                : formatNumber(spec.start + spec.step * static_cast<long long>(range.sequenceIndex), spec);
+        }
+        if (value == range.preview) continue;
+
+        SendMessage(g_preview.editor, SCI_SETTARGETRANGE, position, position + oldLength);
+        const auto newLength = SendMessage(g_preview.editor, SCI_REPLACETARGET, value.size(),
+            reinterpret_cast<LPARAM>(value.data()));
+        offset += newLength - oldLength;
+        range.preview.swap(value);
+        g_preview.previewApplied = true;
+    }
+    g_preview.viewport.restore(g_preview.editor);
 }
 
 void finishPreview(bool keepPreview) {
     if (!g_preview.undoActionOpen) return;
-    if (!keepPreview && g_preview.previewApplied) {
-        SendMessage(g_preview.editor, SCI_SETTEXT, 0, reinterpret_cast<LPARAM>(g_preview.originalText.c_str()));
-    }
     SendMessage(g_preview.editor, SCI_ENDUNDOACTION, 0, 0);
     g_preview.undoActionOpen = false;
-    if (!keepPreview && g_preview.previewApplied) SendMessage(g_preview.editor, SCI_UNDO, 0, 0);
+    if (!keepPreview && g_preview.previewApplied) {
+        SendMessage(g_preview.editor, SCI_UNDO, 0, 0);
+    }
+    g_preview.viewport.restore(g_preview.editor);
 }
 
 POINT dialogPosition() {
-    constexpr int width = 478, height = 145;
-    if (g_preview.ranges.empty()) return {CW_USEDEFAULT, CW_USEDEFAULT};
-    int lastLine = 0;
-    for (const Selection& range : g_preview.ranges) {
-        const int startLine = static_cast<int>(SendMessage(g_preview.editor, SCI_LINEFROMPOSITION, static_cast<WPARAM>(range.start), 0));
-        const int endLine = static_cast<int>(SendMessage(g_preview.editor, SCI_LINEFROMPOSITION, static_cast<WPARAM>(range.end), 0));
-        lastLine = (std::max)(lastLine, (std::max)(startLine, endLine));
-    }
-    const LRESULT selectionStart = SendMessage(g_preview.editor, SCI_POSITIONFROMLINE, static_cast<WPARAM>(lastLine), 0);
+    RECT owner{};
+    GetWindowRect(g_npp.nppHandle, &owner);
     POINT point{
-        static_cast<LONG>(SendMessage(g_preview.editor, SCI_POINTXFROMPOSITION, 0, selectionStart)),
-        static_cast<LONG>(SendMessage(g_preview.editor, SCI_POINTYFROMPOSITION, 0, selectionStart))
+        owner.left + (owner.right - owner.left - DialogWidth) / 2,
+        owner.top + (owner.bottom - owner.top - DialogHeight) / 2
     };
-    ClientToScreen(g_preview.editor, &point);
-    const int lineHeight = static_cast<int>(SendMessage(g_preview.editor, SCI_TEXTHEIGHT, 0, 0));
-    point.y += lineHeight;
     MONITORINFO monitor{sizeof(monitor)};
-    GetMonitorInfoW(MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST), &monitor);
-    if (point.y + height > monitor.rcWork.bottom) point.y -= height + lineHeight;
-    point.x = (std::max)(monitor.rcWork.left, (std::min)(point.x, monitor.rcWork.right - width));
-    point.y = (std::max)(monitor.rcWork.top, (std::min)(point.y, monitor.rcWork.bottom - height));
+    if (GetMonitorInfoW(MonitorFromWindow(g_npp.nppHandle, MONITOR_DEFAULTTONEAREST), &monitor)) {
+        point.x = (std::max)(monitor.rcWork.left, (std::min)(point.x, monitor.rcWork.right - DialogWidth));
+        point.y = (std::max)(monitor.rcWork.top, (std::min)(point.y, monitor.rcWork.bottom - DialogHeight));
+    }
     return point;
 }
 
@@ -362,18 +386,46 @@ LRESULT CALLBACK dialogProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
+bool scrollBackgroundEditor(HWND dialog, const MSG& message) {
+    if (message.message != WM_MOUSEWHEEL && message.message != WM_MOUSEHWHEEL) return false;
+
+    RECT editorBounds{}, dialogBounds{};
+    if (!GetWindowRect(g_preview.editor, &editorBounds) || !GetWindowRect(dialog, &dialogBounds)
+        || !PtInRect(&editorBounds, message.pt) || PtInRect(&dialogBounds, message.pt)) return false;
+
+    const auto keys = GET_KEYSTATE_WPARAM(message.wParam) & ~MK_CONTROL;
+    SendMessage(g_preview.editor, message.message,
+        MAKEWPARAM(keys, GET_WHEEL_DELTA_WPARAM(message.wParam)), message.lParam);
+    g_preview.viewport = EditorViewport::capture(g_preview.editor);
+    return true;
+}
+
 void openInputDialog() {
     WNDCLASSW cls{}; cls.hInstance = g_instance; cls.lpszClassName = DialogClass; cls.lpfnWndProc = dialogProc; cls.hCursor = LoadCursor(nullptr, IDC_ARROW); cls.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
     RegisterClassW(&cls);
     startPreviewSession();
     const POINT position = dialogPosition();
-    HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME, DialogClass, L"Input Sequence", WS_CAPTION | WS_SYSMENU | WS_POPUP, position.x, position.y, 478, 145, g_npp.nppHandle, nullptr, g_instance, nullptr);
-    EnableWindow(g_npp.nppHandle, FALSE); ShowWindow(window, SW_SHOW); UpdateWindow(window);
+    HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME, DialogClass, L"Input Sequence", WS_CAPTION | WS_SYSMENU | WS_POPUP, position.x, position.y, DialogWidth, DialogHeight, g_npp.nppHandle, nullptr, g_instance, nullptr);
+    ShowWindow(window, SW_SHOW); UpdateWindow(window);
     MSG message;
     while (IsWindow(window) && GetMessageW(&message, nullptr, 0, 0) > 0) {
+        if (scrollBackgroundEditor(window, message)) continue;
+        // Keep the owner enabled so Windows can deliver wheel input over it.
+        // Suppress other user input to the owner while preview edits are open.
+        const bool ownerInput = message.hwnd == g_npp.nppHandle || IsChild(g_npp.nppHandle, message.hwnd);
+        if (ownerInput && ((message.message >= WM_KEYFIRST && message.message <= WM_KEYLAST)
+            || (message.message >= WM_MOUSEFIRST && message.message <= WM_MOUSELAST)
+            || (message.message >= WM_NCMOUSEMOVE && message.message <= WM_NCXBUTTONDBLCLK)
+            || message.message == WM_SYSCOMMAND)) {
+            if (message.message != WM_MOUSEMOVE && message.message != WM_NCMOUSEMOVE) {
+                SetActiveWindow(window);
+                SetFocus(GetDlgItem(window, EditId));
+            }
+            continue;
+        }
         if (!IsDialogMessageW(window, &message)) { TranslateMessage(&message); DispatchMessageW(&message); }
     }
-    EnableWindow(g_npp.nppHandle, TRUE); SetForegroundWindow(g_npp.nppHandle);
+    SetForegroundWindow(g_npp.nppHandle);
 }
 
 void showAbout() {
